@@ -1,18 +1,10 @@
-from typing import Optional, Dict, Any
-from uuid import UUID
-
-from fastapi import FastAPI, Query, Header, HTTPException
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import text
 
 from database import engine
-from security import (
-    hash_password,
-    verify_password,
-    create_access_token,
-    decode_token,
-)
+from security import hash_password, verify_password, create_access_token
 
 # =========================
 # APP
@@ -28,189 +20,205 @@ app.add_middleware(
 )
 
 # =========================
-# MODELS
+# UTILIDADES SQL
 # =========================
-class LoginRequest(BaseModel):
-    tienda_id: UUID
-    usuario_id: UUID
-    password: Optional[str] = None
+def qident(colname: str) -> str:
+    import re
+    if re.match(r"^[a-z_][a-z0-9_]*$", colname):
+        return colname
+    colname = colname.replace('"', '""')
+    return f'"{colname}"'
 
+def detect_usuario_pk_column(conn) -> str:
+    r = conn.execute(
+        text("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema='public' AND table_name='usuarios'
+        """)
+    ).fetchall()
 
-class CreateUserRequest(BaseModel):
-    tienda_id: UUID
+    cols = [x[0] for x in r]
+    for c in ["id", "identificación", "identificacion", "identificador"]:
+        if c in cols:
+            return c
+
+    r2 = conn.execute(
+        text("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema='public'
+              AND table_name='usuarios'
+              AND data_type='uuid'
+            LIMIT 1
+        """)
+    ).fetchone()
+
+    if not r2:
+        raise RuntimeError("No se pudo detectar PK de usuarios")
+    return r2[0]
+
+def column_exists(conn, table: str, col: str) -> bool:
+    r = conn.execute(
+        text("""
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema='public'
+              AND table_name=:t
+              AND column_name=:c
+            LIMIT 1
+        """),
+        {"t": table, "c": col},
+    ).fetchone()
+    return r is not None
+
+def pick_first_existing_column(conn, table: str, candidates: list[str]) -> str | None:
+    for c in candidates:
+        if column_exists(conn, table, c):
+            return c
+    return None
+
+# =========================
+# MODELOS
+# =========================
+class LoginBody(BaseModel):
+    tienda_id: str
+    usuario_id: str
+    password: str
+
+class CreateUserBody(BaseModel):
     nombre: str
-    email: Optional[str] = None
-    rol: str = "normal"
-
-
-class AdminSetPasswordRequest(BaseModel):
-    usuario_id: UUID
-    new_password: str
-
+    rol: str
+    password: str
 
 # =========================
-# HELPERS
-# =========================
-def require_user(authorization: Optional[str]) -> Dict[str, Any]:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="No autorizado")
-
-    token = authorization.split(" ", 1)[1]
-    payload = decode_token(token)
-    if not payload:
-        raise HTTPException(status_code=401, detail="Token inválido")
-
-    return payload
-
-
-def require_admin(authorization: Optional[str]) -> Dict[str, Any]:
-    payload = require_user(authorization)
-    if payload.get("rol") != "admin":
-        raise HTTPException(status_code=403, detail="Solo admin")
-    return payload
-
-
-# =========================
-# HEALTH
+# ENDPOINTS
 # =========================
 @app.get("/health")
 def health():
     return {"ok": True}
 
-
-# =========================
-# TIENDAS
-# =========================
 @app.get("/tiendas")
 def get_tiendas():
-    q = text("""
-        SELECT id, nombre
-        FROM tiendas
-        WHERE activa = true
-        ORDER BY nombre
-    """)
     with engine.connect() as conn:
-        rows = conn.execute(q).mappings().all()
+        rows = conn.execute(
+            text("SELECT id, nombre FROM tiendas ORDER BY nombre")
+        ).mappings().all()
     return {"ok": True, "tiendas": rows}
 
-
-# =========================
-# USUARIOS POR TIENDA
-# =========================
 @app.get("/usuarios")
-def get_usuarios(tienda_id: UUID = Query(...)):
-    q = text("""
-        SELECT id, nombre, rol
-        FROM usuarios
-        WHERE tienda_id = :tienda_id
-          AND activo = true
-        ORDER BY nombre
-    """)
+def get_usuarios(tienda_id: str = Query(...)):
     with engine.connect() as conn:
-        rows = conn.execute(q, {"tienda_id": str(tienda_id)}).mappings().all()
+        pk = detect_usuario_pk_column(conn)
+        pk_sql = qident(pk)
+
+        rows = conn.execute(
+            text(f"""
+                SELECT {pk_sql}::text AS id, nombre, rol
+                FROM usuarios
+                WHERE activo = true
+                ORDER BY nombre
+            """)
+        ).mappings().all()
 
     return {"ok": True, "usuarios": rows}
 
-
-# =========================
-# LOGIN
-# =========================
 @app.post("/auth/login")
-def login(body: LoginRequest):
-    q = text("""
-        SELECT
-            id,
-            nombre,
-            rol,
-            tienda_id,
-            password_hash,
-            activo
-        FROM usuarios
-        WHERE id = :usuario_id
-          AND tienda_id = :tienda_id
-        LIMIT 1
-    """)
-
+def login(body: LoginBody):
     with engine.connect() as conn:
+        pk = detect_usuario_pk_column(conn)
+        pk_sql = qident(pk)
+
+        hash_col = pick_first_existing_column(
+            conn,
+            "usuarios",
+            ["password_hash", "hash_contrasena", "hash_de_contrasena"]
+        )
+        if not hash_col:
+            raise HTTPException(status_code=500, detail="No existe password_hash")
+
+        hash_sql = qident(hash_col)
+
         user = conn.execute(
-            q,
+            text(f"""
+                SELECT {pk_sql}::text AS id, nombre, rol, {hash_sql} AS password_hash
+                FROM usuarios
+                WHERE {pk_sql}::text = :uid
+                  AND activo = true
+                LIMIT 1
+            """),
+            {"uid": body.usuario_id},
+        ).mappings().first()
+
+        if not user:
+            return {"ok": False, "detail": "Usuario no encontrado"}
+
+        if not verify_password(body.password, user["password_hash"]):
+            return {"ok": False, "detail": "Contraseña incorrecta"}
+
+        token = create_access_token({
+            "sub": user["id"],
+            "rol": user["rol"],
+            "tienda_id": body.tienda_id
+        })
+
+        return {
+            "ok": True,
+            "token": token,
+            "user": {
+                "id": user["id"],
+                "nombre": user["nombre"],
+                "rol": user["rol"],
+                "tienda_id": body.tienda_id
+            }
+        }
+
+# =========================
+# CREAR USUARIO (SIN TIENDA)
+# =========================
+MASTER_KEY = "CasadeAjo10"
+
+@app.post("/bootstrap/create-user")
+def bootstrap_create_user(body: CreateUserBody, master_key: str = Query(...)):
+    if master_key != MASTER_KEY:
+        raise HTTPException(status_code=401, detail="Clave incorrecta")
+
+    if len(body.password) < 4:
+        raise HTTPException(status_code=422, detail="Contraseña muy corta")
+
+    rol_norm = body.rol.strip().lower()
+    if rol_norm not in {"normal", "admin", "administración", "administracion"}:
+        raise HTTPException(status_code=422, detail="Rol inválido")
+
+    rol_final = "admin" if rol_norm.startswith("admin") else "normal"
+    hashed = hash_password(body.password)
+
+    with engine.begin() as conn:
+        hash_col = pick_first_existing_column(
+            conn,
+            "usuarios",
+            ["password_hash", "hash_contrasena", "hash_de_contrasena"]
+        )
+        if not hash_col:
+            raise HTTPException(status_code=500, detail="No existe password_hash")
+
+        hash_sql = qident(hash_col)
+
+        # 🔒 Email técnico automático (cumple NOT NULL)
+        email_value = f"{body.nombre.lower().replace(' ', '')}@local.pos"
+
+        user = conn.execute(
+            text(f"""
+                INSERT INTO usuarios (nombre, rol, activo, {hash_sql}, email)
+                VALUES (:nombre, :rol, true, :hash, :email)
+                RETURNING id::text AS id, nombre, rol
+            """),
             {
-                "usuario_id": str(body.usuario_id),
-                "tienda_id": str(body.tienda_id),
+                "nombre": body.nombre.strip(),
+                "rol": rol_final,
+                "hash": hashed,
+                "email": email_value,
             }
         ).mappings().first()
 
-    if not user:
-        raise HTTPException(status_code=401, detail="Usuario no encontrado")
-
-    if not user["activo"]:
-        raise HTTPException(status_code=403, detail="Usuario inactivo")
-
-    if not user["password_hash"]:
-        raise HTTPException(
-            status_code=403,
-            detail="Usuario sin contraseña. Contacta al administrador."
-        )
-
-    if not verify_password(body.password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Contraseña incorrecta")
-
-    # 🔥 AQUÍ ESTÁ LA CLAVE: UUID → str
-    token = create_access_token({
-        "user_id": str(user["id"]),
-        "nombre": user["nombre"],
-        "rol": user["rol"],
-        "tienda_id": str(user["tienda_id"]),
-    })
-
-    return {
-        "ok": True,
-        "token": token,
-        "user": {
-            "id": str(user["id"]),
-            "nombre": user["nombre"],
-            "rol": user["rol"],
-            "tienda_id": str(user["tienda_id"]),
-        }
-    }
-
-
-
-# =========================
-# ADMIN: CREAR USUARIO
-# =========================
-@app.post("/admin/create-user")
-def create_user(body: CreateUserRequest, authorization: Optional[str] = Header(None)):
-    require_admin(authorization)
-
-    q = text("""
-        INSERT INTO usuarios (id, tienda_id, nombre, email, rol, activo)
-        VALUES (gen_random_uuid(), :tienda_id, :nombre, :email, :rol, true)
-        RETURNING id
-    """)
-
-    with engine.begin() as conn:
-        row = conn.execute(q, body.dict()).mappings().first()
-
-    return {"ok": True, "usuario_id": row["id"]}
-
-
-# =========================
-# ADMIN: ASIGNAR PASSWORD
-# =========================
-@app.post("/admin/set-password")
-def admin_set_password(body: AdminSetPasswordRequest, authorization: Optional[str] = Header(None)):
-    require_admin(authorization)
-
-    password_hash = hash_password(body.new_password)
-
-    q = text("""
-        UPDATE usuarios
-        SET password_hash = :ph
-        WHERE id = :id
-    """)
-
-    with engine.begin() as conn:
-        conn.execute(q, {"ph": password_hash, "id": str(body.usuario_id)})
-
-    return {"ok": True}
+    return {"ok": True, "user": user}

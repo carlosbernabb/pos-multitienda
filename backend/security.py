@@ -1,38 +1,37 @@
+import os
 from datetime import datetime, timedelta
-from typing import Dict, Any
+from typing import Optional
 
 from jose import jwt, JWTError
 from passlib.context import CryptContext
 
 # =========================
-# CONFIG
+# PASSWORD HASHING
 # =========================
-SECRET_KEY = "cambia_esto_por_algo_largo_y_secreto"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_HOURS = 12
-
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# =========================
-# PASSWORDS
-# =========================
 def hash_password(password: str) -> str:
     return pwd_context.hash(password)
 
-def verify_password(password: str, password_hash: str) -> bool:
-    return pwd_context.verify(password, password_hash)
+def verify_password(password: str, hashed: str) -> bool:
+    return pwd_context.verify(password, hashed)
 
 # =========================
-# TOKENS
+# JWT
 # =========================
-def create_access_token(data: Dict[str, Any]) -> str:
+SECRET_KEY = os.getenv("SECRET_KEY", "dev_secret_change_me")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 12  # 12 horas
+
+def create_access_token(data: dict, expires_minutes: Optional[int] = None) -> str:
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
+    expire = datetime.utcnow() + timedelta(minutes=expires_minutes or ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-def decode_token(token: str) -> Dict[str, Any]:
+def decode_token(token: str) -> dict:
     try:
-        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
     except JWTError:
         return {}

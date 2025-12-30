@@ -6,24 +6,32 @@ function App() {
     JSON.parse(localStorage.getItem("user"))
   );
 
+  const handleLogout = () => {
+    localStorage.clear();
+    setUser(null);
+  };
+
+  // =========================
+  // LOGIN
+  // =========================
   if (!user) {
     return <Login onLogin={setUser} />;
   }
 
+  // =========================
+  // POS PRINCIPAL
+  // =========================
   return (
-    <div style={{ padding: 30 }}>
+    <div style={{ padding: "20px" }}>
       <h1>POS MultiTienda</h1>
 
       <p>
-        Usuario: <b>{user.nombre}</b> | Rol: <b>{user.rol}</b>
+        Usuario: <b>{user.nombre}</b> | Rol:{" "}
+        <b>{user.rol}</b> | Tienda:{" "}
+        <b>{user.tienda_nombre}</b>
       </p>
 
-      <button onClick={() => {
-        localStorage.clear();
-        setUser(null);
-      }}>
-        Cerrar sesión
-      </button>
+      <button onClick={handleLogout}>Cerrar sesión</button>
 
       <hr />
 
